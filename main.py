@@ -1,7 +1,6 @@
 # Importing necessary libraries
-import requests
 import ast
-from urllib.request import Request, urlopen
+from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import math
 from tkinter.filedialog import asksaveasfile
@@ -14,21 +13,33 @@ import shutil
 import zipfile
 import pdfkit
 
-# Extracting cookie Id
-session = requests.Session()
-response = session.get('https://ranobes.net/')
-cookieId = session.cookies.get_dict().get('__cf_bm')
-headers = {'User-Agent': 'Mozilla/5.0',
-           '__cf_bm': '{cookieId}' .format(cookieId=cookieId)}
+# The site fronts every request with a Cloudflare Turnstile bot check that a
+# plain HTTP client can never pass (it needs JS + a canvas fingerprint). A real
+# (even headless) browser clears it automatically, so we drive one persistent
+# browser session for every page fetch instead of urllib/requests.
+playwright = sync_playwright().start()
+browser = playwright.chromium.launch(headless=True)
+browser_context = browser.new_context(
+    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+page = browser_context.new_page()
+
+
+def fetch_soup(url):
+    # "networkidle" times out here (the site keeps a background connection
+    # open); domcontentloaded + a short pause is enough for the Turnstile
+    # check and page script to finish.
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(1500)
+    return BeautifulSoup(page.content(), "html.parser")
+
 
 # Requesting homepage of novel
 URL = input("Enter URL : ")
 print()
-req = Request(URL, headers=headers)
-webpage = urlopen(req).read()
 
 # Parsing using BeautifulSoup
-soup = BeautifulSoup(webpage, "html.parser")
+soup = fetch_soup(URL)
 
 soup.style.decompose()
 
@@ -62,9 +73,7 @@ while i <= int(math.ceil(count / 25)):
         page_num = index_page + "page/{num}/" .format(num=i)
         index_list.append(page_num)
 
-        index_req = Request(page_num, headers=headers)
-        index_webpage = urlopen(index_req).read()
-        index_soup = BeautifulSoup(index_webpage, "html.parser")
+        index_soup = fetch_soup(page_num)
 
         chap_block = index_soup.find("div", id="dle-content")
         chap_block = chap_block.find("script")
@@ -150,9 +159,7 @@ while i < int(end):
 
         # Requesting chapter page
         site = chapter_list[i]
-        site_req = Request(site, headers=headers)
-        site_page = urlopen(site_req).read()
-        site_soup = BeautifulSoup(site_page, "html.parser")
+        site_soup = fetch_soup(site)
         for span in site_soup("span"):
             span.decompose()
         site_soup.find("div", class_="category grey ellipses").decompose()
@@ -188,6 +195,10 @@ while i < int(end):
     i += 1
 
 print()
+
+# Done fetching pages
+browser.close()
+playwright.stop()
 
 # Defining index of book
 book.toc = (epub.Link('intro.xhtml', 'Introduction', 'intro'),
