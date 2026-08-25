@@ -875,6 +875,13 @@ def main():
         # Extracting chapter count
         chapter_num = soup.find(
             "li", title="Glossary + illustrations + division of chapters, etc.")
+        if chapter_num is None:
+            logging.error(
+                "Could not find the chapter list on this page - make sure --url "
+                "points to the novel's main page (with its description/genre "
+                "list and 'Start reading' button), not a link to a specific "
+                "chapter.")
+            return
         chapter_count_text = chapter_num.find("span", class_="grey").text
         count = int(re.findall(r'\d+', chapter_count_text)[0])
         logging.info(f"Available chapters : {count}")
