@@ -2,6 +2,7 @@
 import argparse
 import ast
 import hashlib
+import io
 import logging
 import math
 import os
@@ -15,6 +16,7 @@ from tkinter.filedialog import asksaveasfile
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from ebooklib import epub
+from PIL import Image
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -202,6 +204,15 @@ class BrowserSession:
         self.page.wait_for_timeout(self.wait_ms)
         return BeautifulSoup(safe_page_content(self.page), "html.parser")
 
+    def fetch_bytes(self, url):
+        # Static assets (e.g. cover images) aren't behind the Turnstile check,
+        # so a plain context-scoped request (still carrying this session's
+        # cookies) is enough - no need to navigate a page for it.
+        response = self.context.request.get(url)
+        if not response.ok:
+            raise PlaywrightError(f"HTTP {response.status} fetching {url}")
+        return response.body()
+
     def switch_to_headed(self, url):
         state = self.context.storage_state()
         self.browser.close()
@@ -348,6 +359,183 @@ def fetch_with_retry(session, url, args, *, label, progress_bar=None):
         # Only cache confirmed-good content - never a CAPTCHA/challenge page.
         args.cache.set(url, soup)
         return soup
+
+
+# ---------------------------------------------------------------------------
+# Novel metadata extraction
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NovelMetadata:
+    title: str
+    authors: list = field(default_factory=list)
+    translators: list = field(default_factory=list)
+    publishers: list = field(default_factory=list)
+    genres: list = field(default_factory=list)
+    year: str = ""
+    description: str = ""
+    description_paragraphs: list = field(default_factory=list)
+    cover_url: str = ""
+
+
+def _spec_fields(soup):
+    # The "Authors:" / "Translator:" / "Publishers:" / "Year of publishing:"
+    # facts all live as sibling <li>s in the same <ul>, each shaped as a bare
+    # leading text label followed by either <a> tag(s) or (for label-only
+    # facts like "Translated: 485 chapters") a bare <span>. One generic pass
+    # over that <ul> covers all of them and degrades gracefully (missing key)
+    # for any novel page that lacks one of these facts entirely.
+    spec_div = soup.find("div", class_="r-fullstory-spec")
+    first_ul = spec_div.find("ul") if spec_div else None
+    if first_ul is None:
+        return {}
+    fields = {}
+    for li in first_ul.find_all("li", recursive=False):
+        label_node = next(
+            (c for c in li.children if isinstance(c, NavigableString) and c.strip()), None)
+        if label_node is None:
+            continue
+        label = label_node.strip().rstrip(":")
+        values = [a.get_text(strip=True) for a in li.find_all("a")]
+        if not values:
+            span = li.find("span")
+            if span is not None:
+                values = [span.get_text(strip=True)]
+        fields[label] = values
+    return fields
+
+
+def extract_novel_metadata(soup):
+    h1 = soup.find("h1", class_="title")
+    title = "".join(
+        str(c) for c in h1.children if isinstance(c, NavigableString)).strip() if h1 else ""
+
+    spec = _spec_fields(soup)
+
+    genre_div = soup.find("div", id="mc-fs-genre")
+    genres = [a.get_text(strip=True) for a in genre_div.find_all("a")] if genre_div else []
+
+    description_paragraphs = []
+    desc_div = soup.find("div", class_="moreless__full")
+    if desc_div is not None:
+        toggle = desc_div.find("a", class_="moreless__toggle")
+        if toggle is not None:
+            toggle.decompose()
+        # get_text("\n") inserts exactly one separator per run of <br> tags
+        # (any number of them), which conveniently gives one line per
+        # paragraph regardless of whether the site used single or double <br>.
+        description_paragraphs = [
+            p.strip() for p in desc_div.get_text("\n").split("\n") if p.strip()]
+    description = " ".join(description_paragraphs)
+
+    cover_url = ""
+    og_image = soup.find("meta", attrs={"property": "og:image"})
+    if og_image is not None and og_image.get("content"):
+        cover_url = og_image["content"]
+
+    years = spec.get("Year of publishing", [])
+    return NovelMetadata(
+        title=title,
+        authors=spec.get("Authors", []),
+        translators=spec.get("Translator", []),
+        publishers=spec.get("Publishers", []),
+        genres=genres,
+        year=years[0] if years else "",
+        description=description,
+        description_paragraphs=description_paragraphs,
+        cover_url=cover_url,
+    )
+
+
+def apply_book_metadata(book, metadata, source_url):
+    book.set_title(metadata.title or "Untitled Novel")
+    book.set_language('en')
+
+    for i, name in enumerate(metadata.authors or ["Unknown"], start=1):
+        book.add_author(name, role='aut', uid=f"author{i}")
+
+    for i, name in enumerate(metadata.translators, start=1):
+        uid = f"translator{i}"
+        book.add_metadata('DC', 'contributor', name, {'id': uid})
+        book.add_metadata(
+            None, 'meta', 'trl', {'refines': f'#{uid}', 'property': 'role', 'scheme': 'marc:relators'})
+
+    for name in metadata.publishers:
+        book.add_metadata('DC', 'publisher', name)
+
+    for genre in metadata.genres:
+        book.add_metadata('DC', 'subject', genre)
+
+    if metadata.year:
+        book.add_metadata('DC', 'date', metadata.year)
+
+    if metadata.description:
+        book.add_metadata('DC', 'description', metadata.description)
+
+    novel_id = re.search(r'/novels/(\d+)-', source_url)
+    if novel_id:
+        book.set_identifier(f"ranobes-{novel_id.group(1)}")
+
+    book.add_metadata('DC', 'source', source_url)
+
+
+def apply_series_metadata(book, series_name, volume_label):
+    # EPUB3's standard series shape, plus the de-facto calibre:series /
+    # calibre:series_index custom meta tags calibre reads into its own
+    # Series column - that's what actually powers the "rename to
+    # [Series 02] Title on transfer" plugboard trick, which is the only
+    # thing that reliably makes same-series exports group together on a
+    # Kindle (it doesn't otherwise auto-group personal documents by series).
+    book.add_metadata(None, 'meta', series_name, {'id': 'series', 'property': 'belongs-to-collection'})
+    book.add_metadata(None, 'meta', 'series', {'refines': '#series', 'property': 'collection-type'})
+    book.add_metadata(None, 'meta', '', {'name': 'calibre:series', 'content': series_name})
+    index_match = re.search(r'\d+(?:\.\d+)?', volume_label)
+    if index_match:
+        book.add_metadata(None, 'meta', index_match.group(), {'refines': '#series', 'property': 'group-position'})
+        book.add_metadata(None, 'meta', '', {'name': 'calibre:series_index', 'content': index_match.group()})
+
+
+def _cover_bytes_to_jpeg(raw_bytes):
+    # Kindle doesn't render the site's native .webp covers (shows as a
+    # broken image on-device), so always normalize to JPEG before embedding.
+    with Image.open(io.BytesIO(raw_bytes)) as img:
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+
+
+def build_intro_html(metadata):
+    # A metadata "jacket" page - the same idea as the info page Calibre
+    # generates at the front of a book (title/byline/facts table, then the
+    # synopsis) - rather than just dumping the site's raw description markup.
+    def fact_row(label, value):
+        if not value:
+            return ""
+        return (
+            '<tr>'
+            f'<td style="padding:4px 14px 4px 0;font-weight:bold;white-space:nowrap;'
+            f'vertical-align:top">{escape(label)}</td>'
+            f'<td style="padding:4px 0">{escape(value)}</td>'
+            '</tr>')
+
+    facts = "".join([
+        fact_row("Author", ", ".join(metadata.authors)),
+        fact_row("Translator", ", ".join(metadata.translators)),
+        fact_row("Publisher", ", ".join(metadata.publishers)),
+        fact_row("Published", metadata.year),
+        fact_row("Genres", ", ".join(metadata.genres)),
+    ])
+
+    synopsis = "".join(
+        f'<p style="margin:0 0 1em 0">{escape(p)}</p>' for p in metadata.description_paragraphs)
+
+    return f'''{FONT}<div style="font-family:'Nunito Sans'; padding:0 10px; line-height:1.6">
+        <h1 style="margin-bottom:.1em">{escape(metadata.title)}</h1>
+        <table style="margin:1em 0 1.5em 0;border-collapse:collapse">{facts}</table>
+        {'<h2>Synopsis</h2>' + synopsis if synopsis else ''}
+    </div>'''
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +743,14 @@ def parse_args():
         help="Fetch every page fresh, ignoring and not writing to the cache "
              "(default: caching is on)")
     parser.add_argument(
+        "--volume-label", default="",
+        help="Optional label appended to the title (e.g. 'Vol. 2') and recorded as "
+             "series/collection metadata, so multiple exports of the same novel "
+             "sort together and can be recognized as parts of one series by tools "
+             "that read that metadata (e.g. Calibre). A number found in the label "
+             "is also recorded as the volume/series index. Off by default, since "
+             "Kindle itself does not auto-group personal documents by series.")
+    parser.add_argument(
         "--output-dir", default=DEFAULT_OUTPUT_DIR,
         help="Directory the save dialog opens in by default, pre-filled with "
              f"a name based on the novel title and chapter range (default: "
@@ -600,12 +796,20 @@ def build_output_filename(book, chapter_epub):
     return f"{title} - {chapter_part}.epub"
 
 
-def finalize_and_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR):
-    book.toc = (epub.Link('intro.xhtml', 'Introduction', 'intro'),
-                (epub.Section('Chapters'), tuple(chapter_epub)))
+def finalize_and_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR, intro_item=None):
+    toc = []
+    if intro_item is not None:
+        toc.append(epub.Link(intro_item.file_name, 'Introduction', 'intro'))
+    toc.append((epub.Section('Chapters'), tuple(chapter_epub)))
+    book.toc = tuple(toc)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = chapter_epub
+    # The intro item must be in the spine (not just the manifest/nav) - a
+    # manifest item outside the spine has no position in the linear reading
+    # order: Calibre's viewer can't resolve a TOC link into it at all, and
+    # Kindle's converter tacks such items onto the very end when computing
+    # locations, even though the TOC still lists it first.
+    book.spine = ([intro_item] if intro_item is not None else []) + chapter_epub
 
     os.makedirs(output_dir, exist_ok=True)
     save_file = asksaveasfile(
@@ -624,7 +828,7 @@ def finalize_and_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR):
     logging.info("Enjoy your read...")
 
 
-def offer_partial_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR):
+def offer_partial_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR, intro_item=None):
     if not chapter_epub:
         logging.info("No chapters were fetched - nothing to save.")
         return
@@ -638,10 +842,10 @@ def offer_partial_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR):
         # No stdin to ask - default to saving rather than silently discarding
         # chapters that were already successfully fetched.
         logging.warning("No input available - saving the chapters fetched so far by default.")
-        finalize_and_save(book, chapter_epub, output_dir)
+        finalize_and_save(book, chapter_epub, output_dir, intro_item=intro_item)
         return
     if response in ("y", "yes"):
-        finalize_and_save(book, chapter_epub, output_dir)
+        finalize_and_save(book, chapter_epub, output_dir, intro_item=intro_item)
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +863,7 @@ def main():
     session = BrowserSession(timeout_ms=args.timeout, wait_ms=args.wait)
     book = epub.EpubBook()
     chapter_epub = []
+    descr = None
 
     try:
         soup = fetch_with_retry(session, args.url, args, label="novel page")
@@ -715,27 +920,29 @@ def main():
         chapter_list.reverse()
 
         # Creating EpubBook metadata
-        book.add_author(str(soup.find("span", class_="tag_list").text.strip()))
+        metadata = extract_novel_metadata(soup)
+        series_name = metadata.title
+        if args.volume_label:
+            metadata.title = f"{series_name}, {args.volume_label}"
+        apply_book_metadata(book, metadata, args.url)
+        if args.volume_label:
+            apply_series_metadata(book, series_name, args.volume_label)
 
         for span in soup("span"):
             span.decompose()
 
-        f = open("cover.jpg", 'wb')
-        f.close()
-        book.set_cover("image.jpg", open("cover.jpg", 'rb').read())
-        os.remove("cover.jpg")
-
-        book.set_title(str(soup.find(class_="title").text.strip()))
-        book.set_language('en')
+        if metadata.cover_url:
+            try:
+                cover_bytes = _cover_bytes_to_jpeg(session.fetch_bytes(metadata.cover_url))
+                book.set_cover("cover.jpg", cover_bytes)
+            except (PlaywrightError, OSError) as e:
+                logging.warning(
+                    f"Could not fetch/convert cover image ({classify_exception(e)}) - "
+                    "continuing without one.")
 
         # Extracting introduction to novel
         descr = epub.EpubHtml(title='Introduction', file_name='intro.xhtml', lang='en')
-        descr_novel = soup.find("div", class_="cont-text showcont-h")
-        descr_para = '''{font}<style>h2{{font-family:'Nunito Sans'; padding:0 10px; line-height: 1.6}}</style>
-            <h2>Introduction</h2>'''.format(font=FONT)
-        descr_para += '''{font}<style>body{{font-family:'Nunito Sans'; padding:0 10px; line-height: 1.6}}</style>
-            <body>{descr_novel}</body>'''.format(font=FONT, descr_novel=descr_novel)
-        descr.content = descr_para
+        descr.content = build_intro_html(metadata)
         book.add_item(descr)
 
         # Extracting chapters
@@ -797,14 +1004,14 @@ def main():
 
             i += 1
 
-        finalize_and_save(book, chapter_epub, args.output_dir)
+        finalize_and_save(book, chapter_epub, args.output_dir, intro_item=descr)
 
     except RunAborted as e:
         logging.warning(str(e))
-        offer_partial_save(book, chapter_epub, args.output_dir)
+        offer_partial_save(book, chapter_epub, args.output_dir, intro_item=descr)
     except KeyboardInterrupt:
         logging.info("Interrupted by user, shutting down...")
-        offer_partial_save(book, chapter_epub, args.output_dir)
+        offer_partial_save(book, chapter_epub, args.output_dir, intro_item=descr)
     finally:
         session.close()
 
