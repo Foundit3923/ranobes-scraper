@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
 from tkinter.filedialog import asksaveasfile
-
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from ebooklib import epub
 from PIL import Image
@@ -127,6 +126,7 @@ class PageCache:
         if not self.enabled:
             return None
         path = self._path_for(url)
+        print("File Path: " + path)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return BeautifulSoup(f.read(), "html.parser")
@@ -847,6 +847,34 @@ def offer_partial_save(book, chapter_epub, output_dir=DEFAULT_OUTPUT_DIR, intro_
     if response in ("y", "yes"):
         finalize_and_save(book, chapter_epub, output_dir, intro_item=intro_item)
 
+def parse_tag_content(tagContent: Tag):
+    tagName = tagContent.name
+    openTag = "<" + tagName + ">"
+    closeTag = "</" + tagName + ">"
+    concatString: str = ""
+    for element in tagContent.contents:
+        if isinstance(element, str):
+            concatString += element
+        else:
+            concatString += parse_tag_content(element)
+    if tagName == "br":
+        return "<" + tagName + " />"
+    else:
+        return openTag + concatString + closeTag
+
+def parse_paragraph(tagContent: Tag):
+    tagName = tagContent.name
+    concatString: str = ""
+    for element in tagContent.contents:
+        if isinstance(element, str):
+            concatString += element
+        else:
+            concatString += parse_tag_content(element)
+    if tagName == "br":
+        return "<" + tagName + " />"
+    else:
+        return concatString
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -991,13 +1019,50 @@ def main():
             file_name = f'ch{i + 1}.xhtml'
             c = epub.EpubHtml(title=str(chapter_title.text.strip()), file_name=file_name)
 
+            #TODO: extract all tables, table/paragraph order, and reformat tables for e-readers
             # Extracting chapter content
-            chapter_content = site_soup.find_all("p")
+            
+            chapter_parent:Tag = site_soup.find(["p"]).parent
+            chapter_content = site_soup.find_all(["p", "table"])
             para = '''{font}<h2 style="font-family:'Nunito Sans'; padding:0 10px; line-height: 1.6">
                 {title_page}</h2>'''.format(font=FONT, title_page=str(chapter_title.text.strip()))
-            for j in chapter_content:
-                para += '''{font}<p style="font-family:'Nunito Sans'; padding:0 10px; line-height: 1.6">{element}
-                    </p>'''.format(font=FONT, element=str(j.text.strip()))
+
+            reference_script: str = ""
+            for child in chapter_parent.contents:
+                if isinstance(child, str):
+                    #string outside <p>
+                    if child != '\n' and child != ' ' and child != '':
+                        reference_script += child
+                elif child.css.tag.name == 'p' or child.css.tag.name == 'table':
+                    if child.text != '\n' and child.text != ' ' and child.text != '':
+                        reference_script += child.text
+
+            reference_script = reference_script.strip()
+            for j in range(len(chapter_content)):
+                string_to_find = chapter_content[j].text.strip()
+                while string_to_find != '\n' and reference_script != '' and reference_script.find(string_to_find) != 0:
+                    end_index = reference_script.find(string_to_find)
+                    missing_sub_string = reference_script[:end_index]
+                    para += '''{font}<p style="font-family:'Nunito Sans'; padding:0 10px; line-height: 1.6">{element}
+                                        </p>'''.format(font=FONT, element=str(missing_sub_string.strip()))
+                    reference_script = reference_script.replace(missing_sub_string, "", 1)
+                    reference_script = reference_script.strip()
+
+                reference_script = reference_script.replace(string_to_find, "", 1)   
+                reference_script = reference_script.strip()
+
+                if chapter_content[j].css.tag.name == 'table':
+                    flattenedTable = parse_tag_content(chapter_content[j])
+                    para += flattenedTable
+                    continue
+                elif chapter_content[j].css.tag.name == 'br':
+                    para += "<br />"
+                    continue
+                elif chapter_content[j].css.tag.name == 'p':
+                    parsed_text = parse_paragraph(chapter_content[j])
+                    para += '''{font}<p style="font-family:'Nunito Sans'; padding:0 10px; line-height: 1.6">{element}
+                        </p>'''.format(font=FONT, element=str(parsed_text.strip()))
+                        
             if comments_html:
                 para += comments_html
             c.content = para
